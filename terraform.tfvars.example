@@ -1,0 +1,3 @@
+yourname    = "<your-lowercase-name>"
+location    = "centralus"
+alert_email = "<you@example.com>"
