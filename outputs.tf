@@ -7,8 +7,9 @@ output "log_analytics_workspace_id" {
 }
  
 output "logic_app_callback_url" {
-  description = "Use this URL when configuring the Logic App HTTP trigger in the portal."
-  value       = azurerm_logic_app_workflow.cost_alert.access_endpoint
+  description = "HTTP trigger URL for the cost alert Logic App (contains a SAS signature; treat as a secret)."
+  value       = azurerm_logic_app_trigger_http_request.alert.callback_url
+  sensitive   = true
 }
  
 output "action_group_id" {

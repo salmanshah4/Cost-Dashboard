@@ -2,7 +2,7 @@
 
 **Status:** ✅ Complete — budget alerts deployed with Terraform, Logic App email notifications tested, and Workbook dashboard built
 
-Cost tracking and alerting for an Azure subscription: a monthly Cost Management budget with alerts at 25%, 50%, and 100% of spend, an Action Group that emails the owner and triggers a Logic App notification workflow, subscription activity logs centralized in Log Analytics, and an Azure Workbook dashboard in the portal. Infrastructure is Terraform; the Logic App steps and Workbook are built in the portal.
+Cost tracking and alerting for an Azure subscription: a monthly Cost Management budget with alerts at 25%, 50%, and 100% of spend, an Action Group that emails the owner and triggers a Logic App notification workflow, subscription activity logs centralized in Log Analytics, and an Azure Workbook dashboard in the portal. Infrastructure — including the Logic App's HTTP trigger and its connection to the Action Group — is Terraform; only the email step and the Workbook are built in the portal.
 
 ## 🎬 Video Walkthrough
 
@@ -77,9 +77,9 @@ The budget and the diagnostic setting live at **subscription** scope, not in the
 
 ```
 .
-├── main.tf                     # RG, Log Analytics, Action Group, subscription budget, Logic App, subscription diagnostic setting
+├── main.tf                     # RG, Log Analytics, Action Group (email + Logic App receivers), budget, Logic App + HTTP trigger, diagnostic setting
 ├── variables.tf                # yourname, location, alert_email, tags
-├── outputs.tf                  # RG name, workspace ID, Logic App endpoint, Action Group ID
+├── outputs.tf                  # RG name, workspace ID, Logic App callback URL (sensitive), Action Group ID
 ├── terraform.tfvars.example    # Copy to terraform.tfvars (gitignored) and fill in
 ├── .terraform.lock.hcl         # Pinned provider version
 └── .gitignore                  # Excludes *.tfvars, state, .terraform/
@@ -126,6 +126,7 @@ The $10 amount is set low on purpose for a lab subscription, so the thresholds a
 | Budget scope | `data.azurerm_client_config.current.subscription_id` (bare GUID) | `data.azurerm_subscription.current.id` (`/subscriptions/<guid>`) | The budget resource expects the full subscription resource ID; a bare GUID fails to parse |
 | Start date | Hard-coded `"2026-03-01T00:00:00Z"` | `formatdate("YYYY-MM-01'T'00:00:00Z", timestamp())` | Always the first of the current month, so it never goes stale and triggers `BudgetStartDateInvalid` |
 | Start date drift | — | `lifecycle { ignore_changes = [time_period] }` | `timestamp()` changes on every run; without this, every `plan` would want to modify the budget |
+| Logic App ↔ Action Group | HTTP trigger built in the designer, receiver added with `az monitor action-group update` | `azurerm_logic_app_trigger_http_request` + `logic_app_receiver` block in Terraform | The whole alert path is code, so a later `terraform apply` can't drop the receiver, and Windows `cmd.exe` never mangles the callback URL |
 | Region | `East US` | `centralus` | Region used for this deployment |
 
 ## 🪜 Deployment Steps
@@ -170,41 +171,39 @@ terraform plan "-out=main.tfplan"
 terraform apply main.tfplan
 ```
 
-Expect 6 resources: resource group, Log Analytics workspace, Action Group, budget, Logic App, and diagnostic setting. Quote the `-out=` argument in PowerShell, otherwise it splits on the period.
+Expect 7 resources: resource group, Log Analytics workspace, Action Group, budget, Logic App, its HTTP trigger, and the diagnostic setting. Quote the `-out=` argument in PowerShell, otherwise it splits on the period.
 
 > Right after apply, Azure Monitor emails a confirmation that your address was added to `ag-cost-alerts-syed`. That's expected.
 
-### Step 3 — Configure the Logic App
+### Step 3 — Add the email step to the Logic App
 
-Terraform creates `la-cost-alert-syed` as an empty workflow; the steps are built in the **Logic app designer**:
+Terraform already created the **When a HTTP request is received** trigger and connected it to the Action Group. The only manual piece is the email action, because email connectors need an interactive sign-in. In `la-cost-alert-syed` → **Logic app designer**:
 
-1. **Trigger:** **When a HTTP request is received**. Save once so the designer generates the **HTTP POST URL**, then copy it.
-2. **Send an email (V2)** — Outlook.com for a personal Microsoft account, Office 365 Outlook for a work/school account:
+1. Under the existing HTTP trigger, add **Send an email (V2)** — Outlook.com for a personal Microsoft account, Office 365 Outlook for a work/school account:
     - **To:** your alert email
     - **Subject:** `Azure Cost Alert — Budget Threshold Reached`
     - **Body:** the trigger's **Body** from dynamic content (the full alert payload)
-3. **Save**.
+2. **Save**. Leave the trigger itself as it is — it's managed by Terraform.
 
-**Test it directly** before connecting it to the budget (paste your POST URL between the single quotes):
+**Test it directly:**
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri '<HTTP POST URL>' -ContentType 'application/json' -Body '{"test":"Budget threshold reached"}'
+$url = terraform output -raw logic_app_callback_url
+```
+
+```powershell
+Invoke-RestMethod -Method Post -Uri $url -ContentType 'application/json' -Body '{"test":"Budget threshold reached"}'
 ```
 
 The email should arrive within a minute, and the run shows as **Succeeded** in the Logic App's run history.
 
-### Step 4 — Connect the Logic App to the Action Group
+### Step 4 — Verify the Action Group wiring
 
-Portal → **Monitor → Action groups → `ag-cost-alerts-syed` → Edit → Actions**:
+```powershell
+az monitor action-group show --name ag-cost-alerts-syed --resource-group rg-cost-dashboard-syed --query "{Email:emailReceivers[].emailAddress, LogicApp:logicAppReceivers[].name}" -o json
+```
 
-- **Action type:** Logic App
-- **Name:** `la-webhook`
-- **Logic App:** `la-cost-alert-syed`, trigger **When a HTTP request is received**
-- **Enable the common alert schema:** Yes
-
-Save, then use **Test action group** on the Action Group to fire a sample notification through both the email receiver and the Logic App.
-
-> The portal is the reliable route on Windows: the callback URL contains `&` characters, and `az` on Windows re-parses arguments through `cmd.exe`, which splits the URL apart when it's passed to `az monitor action-group update`.
+Expected: your email address and `la-webhook`. Then use **Test action group** in the portal (Monitor → Action groups → `ag-cost-alerts-syed`) to fire a sample notification through both the email receiver and the Logic App.
 
 ### Step 5 — Build the Workbook dashboard
 
@@ -322,7 +321,7 @@ Known gotchas for this setup and how to resolve them:
 | Budget subscription ID fails to parse | The budget needs `/subscriptions/<guid>`, not the bare GUID | Use `data.azurerm_subscription.current.id` (as this repo does) |
 | Every `terraform plan` wants to change the budget | `timestamp()` produces a new value on each run | `lifecycle { ignore_changes = [time_period] }` (as this repo does) |
 | `AuthorizationFailed` creating the budget | Your account lacks budget permissions at subscription scope | Assign **Cost Management Contributor** on the subscription |
-| `LogicAppCallbackUrlIsNotValid` from `az monitor action-group update` on Windows | `cmd.exe` splits the callback URL at its `&` characters | Add the Logic App receiver in the portal (Step 4) |
+| `LogicAppCallbackUrlIsNotValid` from `az monitor action-group update` on Windows | `cmd.exe` splits the callback URL at its `&` characters | Not needed in this repo — the receiver is set in Terraform from the trigger's `callback_url` |
 | Email connector asks for sign-in / won't connect | Email connectors need interactive OAuth; Office 365 Outlook needs a work/school mailbox | Sign in through the designer; use Outlook.com for a personal account |
 | Workbook query won't run | No resource scope selected for the Azure Resource Graph query | Select the subscription as the scope first |
 | No "Cost Management" option under Add metric | Cost Management doesn't emit Azure Monitor metrics | Use the Logic App's run metrics for alert activity instead |
@@ -332,7 +331,7 @@ Known gotchas for this setup and how to resolve them:
 
 - Double-check the alert email before deploying — alerts going to the wrong inbox are as bad as no alerts.
 - The budget and diagnostic setting are **subscription-scoped**: they cover everything in the subscription, not just this project, and need subscription-level permissions to create or remove.
-- The Logic App receiver is added to the Action Group in the portal, outside Terraform. A later `terraform apply` can reset the Action Group to match `main.tf` and drop that receiver — re-check it after any apply, or move it into Terraform (see Next Iteration).
+- The HTTP trigger is managed by Terraform. Edit only the email action in the designer; changing the trigger there will be reverted on the next `terraform apply`.
 - Test the Logic App HTTP trigger before relying on it; a broken workflow fails silently from the owner's point of view.
 - Review thresholds carefully — too low and alerts become noise, too high and they arrive too late.
 - Treat the Logic App HTTP POST URL like a password: its SAS signature lets anyone who has it trigger the workflow.
@@ -355,10 +354,9 @@ This removes the resource group and its contents, plus the subscription-scoped b
 
 ## 🔭 Next Iteration
 
-- Add a `logic_app_receiver` block to the Action Group in Terraform so the whole alert path is code
 - Add `Forecasted` threshold notifications to warn before spend actually crosses the limit
 - Make the budget `amount` a variable instead of a hard-coded value
-- Define the Logic App workflow and the Workbook in Terraform (`azurerm_logic_app_trigger_http_request`, `azurerm_application_insights_workbook`)
+- Define the email action (with its API connection) and the Workbook in Terraform (`azurerm_application_insights_workbook`)
 - Add a scheduled cost export to Storage and a weekly spend-comparison email by service and resource group
 
 ## 🧠 Key Takeaways
@@ -366,7 +364,7 @@ This removes the resource group and its contents, plus the subscription-scoped b
 - **Staged alerts buy time.** A warning at 25% is far more useful than one at 100% — the owner can act while there's still budget left.
 - **Time-based values need special handling in IaC.** A computed start date fixes stale dates, but only `ignore_changes` stops it from showing up as drift on every plan.
 - **Scope matters.** The budget and diagnostic setting sit above the resource group, so they behave differently from everything else — on permissions, on what they cover, and on cleanup.
-- **Know where Terraform ends.** Provisioning the Logic App in Terraform and building its steps in the designer is pragmatic, but anything configured by hand can drift from code and needs to be checked.
+- **Keep the wiring in code.** Anything configured by hand next to Terraform can be silently reset by the next `apply`. Moving the HTTP trigger and the Action Group's Logic App receiver into Terraform means only the OAuth-bound email step lives in the portal.
 - **The deliverable is clarity.** The point isn't the resources — it's turning an unreadable bill into early, plain-language warnings an owner can act on.
 
 ---

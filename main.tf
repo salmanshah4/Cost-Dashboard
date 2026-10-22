@@ -35,6 +35,15 @@ resource "azurerm_monitor_action_group" "email_alerts" {
     email_address           = var.alert_email
     use_common_alert_schema = true
   }
+
+  # Calls the Logic App's HTTP trigger whenever a budget threshold fires.
+  # Managed here (not in the portal) so terraform apply never drops it.
+  logic_app_receiver {
+    name                    = "la-webhook"
+    resource_id             = azurerm_logic_app_workflow.cost_alert.id
+    callback_url            = azurerm_logic_app_trigger_http_request.alert.callback_url
+    use_common_alert_schema = true
+  }
  
   tags = var.tags
 }
@@ -83,6 +92,15 @@ resource "azurerm_logic_app_workflow" "cost_alert" {
   location            = var.location
   resource_group_name = azurerm_resource_group.main.name
   tags                = var.tags
+}
+
+# HTTP trigger for the Logic App. Its callback URL is wired into the Action Group above.
+# The Send email action is added in the portal designer afterwards, because email
+# connectors need an interactive OAuth sign-in that Terraform can't perform.
+resource "azurerm_logic_app_trigger_http_request" "alert" {
+  name         = "When_a_HTTP_request_is_received"
+  logic_app_id = azurerm_logic_app_workflow.cost_alert.id
+  schema       = "{}"
 }
 resource "azurerm_monitor_diagnostic_setting" "subscription_logs" {
   name                       = "diag-sub-to-law"
